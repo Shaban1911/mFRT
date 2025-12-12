@@ -1,0 +1,8 @@
+{
+  "name": "Neuro-Symbolic Rehab Agent",
+  "description": "A bicameral AI system for stroke rehabilitation using MediaPipe for reflex safety and Gemini 3 for reasoning and empathy.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
