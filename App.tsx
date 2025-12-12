@@ -6,7 +6,7 @@ import { ReportCard } from './components/ReportCard';
 import { usePoseEstimation } from './hooks/usePoseEstimation';
 import { useGeminiLive } from './hooks/useGeminiLive';
 import { SafetyZone, SessionPhase, AttemptMetric } from './types';
-import { Crosshair, Repeat, Mic, Square, Power, Activity } from 'lucide-react';
+import { Crosshair, Mic, Square, Power, Activity, Ruler, Scaling } from 'lucide-react';
 
 // Trial State Machine
 type TrialPhase = 'IDLE' | 'REACHING' | 'RETURNING' | 'COOLDOWN';
@@ -15,12 +15,19 @@ function App() {
   const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
   const [phase, setPhase] = useState<SessionPhase>(SessionPhase.LOBBY);
   const [activeSide, setActiveSide] = useState<'LEFT' | 'RIGHT'>('LEFT');
-  const [showAutoStart, setShowAutoStart] = useState(false);
   const [isSystemInitialized, setIsSystemInitialized] = useState(false);
+  
+  // Anthropometry
+  const [patientHeight, setPatientHeight] = useState<number>(170);
+  const [patientArmLength, setPatientArmLength] = useState<number>(75);
+
+  // Calibration Countdown State
+  const [countdown, setCountdown] = useState<number | null>(null);
 
   // Clinical Protocol State
   const [history, setHistory] = useState<AttemptMetric[]>([]);
   const [trialPhase, setTrialPhase] = useState<TrialPhase>('IDLE');
+  const [cooldownTimer, setCooldownTimer] = useState(0);
   
   // Real-time tracking
   const trialStartTime = useRef<number>(0);
@@ -47,6 +54,11 @@ function App() {
       setHistory([]); 
   }, []);
 
+  const startCountdownProtocol = useCallback(() => {
+      setCountdown(5);
+      speak("Sit back. Feet flat. Arms at ninety degrees.");
+  }, []);
+
   const performStartGame = useCallback(() => {
       setPhase(SessionPhase.GAME);
       setHistory([]);
@@ -56,7 +68,7 @@ function App() {
   const { poseState, calibrate, isLoading } = usePoseEstimation(videoElement, activeSide, performCalibration);
   
   const { isConnected, connect, sendVisualAlert, messages, resumeAudio, volume } = useGeminiLive({
-      onCalibrationCmd: performCalibration,
+      onCalibrationCmd: startCountdownProtocol, // Voice command triggers countdown first
       onStartGameCmd: performStartGame
   });
 
@@ -67,27 +79,33 @@ function App() {
       setIsSystemInitialized(true);
   };
 
-  // 2. CALIBRATION LOGIC
+  // 2. COUNTDOWN LOGIC (THE FORCE-LOCK TRIGGER)
   useEffect(() => {
-      if (phase === SessionPhase.CALIBRATION && poseState.worldLandmarks) {
-          calibrate();
-      }
-  }, [phase, calibrate, poseState.worldLandmarks]);
+      if (countdown === null) return;
 
-  useEffect(() => {
-      let timeout: ReturnType<typeof setTimeout>;
-      if (phase === SessionPhase.CALIBRATION && poseState.isCalibrated) {
-          timeout = setTimeout(() => {
-              setPhase(SessionPhase.GAME);
-              setTrialPhase('IDLE');
-              setHistory([]);
-              speak("Calibration complete. Starting assessment.");
-          }, 2000);
+      if (countdown > 0) {
+          const timer = setTimeout(() => setCountdown(c => c !== null ? c - 1 : null), 1000);
+          return () => clearTimeout(timer);
+      } else {
+          // Countdown finished -> Trigger Actual Calibration (Force Lock)
+          setCountdown(null);
+          // FUSION CALIBRATION: Pass both Height and Arm Length
+          calibrate({ height: patientHeight, armLength: patientArmLength }); 
       }
-      return () => clearTimeout(timeout);
+  }, [countdown, calibrate, patientHeight, patientArmLength]); 
+
+  // 3. CALIBRATION -> GAME TRANSITION (Instant)
+  useEffect(() => {
+      // As soon as the worker reports calibration is locked, we switch to GAME.
+      if (phase === SessionPhase.CALIBRATION && poseState.isCalibrated) {
+          setPhase(SessionPhase.GAME);
+          setTrialPhase('IDLE');
+          setHistory([]);
+          speak("Go! Reach forward.");
+      }
   }, [phase, poseState.isCalibrated]);
 
-  // 3. CLINICAL TRIAL STATE MACHINE (Robust)
+  // 4. CLINICAL TRIAL STATE MACHINE
   useEffect(() => {
       if (phase !== SessionPhase.GAME) return;
 
@@ -96,8 +114,9 @@ function App() {
       const vel = poseState.velocity;
       const angle = poseState.angle;
       const isRed = poseState.zone === SafetyZone.RED;
+      const enginePhase = poseState.internalPhase; // Uses worker state
 
-      // Update Peak Values if Active
+      // Update Peak Values
       if (trialPhase === 'REACHING' || trialPhase === 'RETURNING') {
           currentTrial.current.maxReach = Math.max(currentTrial.current.maxReach, reach);
           currentTrial.current.maxVel = Math.max(currentTrial.current.maxVel, vel);
@@ -108,8 +127,8 @@ function App() {
 
       switch (trialPhase) {
           case 'IDLE':
-              // Start Trigger: > 5.0cm
-              if (reach > 5.0) {
+              // SYNC with Worker's Phase Detection
+              if (enginePhase === 'REACHING') {
                   setTrialPhase('REACHING');
                   trialStartTime.current = now;
                   currentTrial.current = { 
@@ -128,23 +147,20 @@ function App() {
               if (now - trialStartTime.current > 10000) {
                   setTrialPhase('RETURNING');
               }
-              // B. Return Trigger
-              // Must have reached at least 8cm to consider returning, else it's jitter
-              if (currentTrial.current.maxReach > 8.0 && reach < currentTrial.current.maxReach * 0.9) {
+              // B. Worker signals completion or return
+              if (enginePhase === 'RETURNING' || enginePhase === 'COMPLETED' || enginePhase === 'LOCKED') {
                   setTrialPhase('RETURNING');
               }
               break;
 
           case 'RETURNING':
-              // End Trigger: < 5.0cm (Back to Neutral)
-              if (reach < 5.0) {
-                  // VALIDATION
-                  if (currentTrial.current.maxReach < 8.0) {
-                      // FALSE START / TWITCH
-                      speak("Relax. Get ready.");
+              // End Trigger: Worker goes back to LOCKED or UNSTABLE or Reach < 5cm
+              if (reach < 5.0 || enginePhase === 'LOCKED' || enginePhase === 'UNSTABLE') {
+                  // FALSE START / JITTER LOGIC (< 5.0 cm MAX Reach)
+                  if (currentTrial.current.maxReach < 5.0) {
                       setTrialPhase('IDLE');
                   } else {
-                      // VALID TRIAL
+                      // VALID TRIAL LOGGING
                       const newMetric: AttemptMetric = {
                           id: Date.now(),
                           maxReachCm: currentTrial.current.maxReach,
@@ -152,27 +168,26 @@ function App() {
                           clinicalScore: currentTrial.current.maxScore,
                           maxVelocity: currentTrial.current.maxVel,
                           triggeredFail: currentTrial.current.fail,
-                          failureSnapshot: currentTrial.current.failSnapshot // <--- SAVE IT
+                          failureSnapshot: currentTrial.current.failSnapshot
                       };
                       
                       setHistory(prev => {
                           const updated = [...prev, newMetric];
-                          // Feedback based on performance
                           const val = currentTrial.current.maxReach;
                           if (val > 25) speak("Excellent reach!");
-                          else if (val > 15) speak("Good effort.");
-                          else speak("Trial saved.");
+                          else if (val > 15) speak("Good stability.");
+                          else speak("Rest now.");
                           return updated;
                       });
                       
                       currentTrial.current.failSnapshot = undefined;
                       setTrialPhase('COOLDOWN');
+                      setCooldownTimer(5); // 5 Seconds Strict ATP-PC Recovery
                   }
               }
               break;
 
           case 'COOLDOWN':
-              // Handled by effect below to prevent rapid re-trigger
               break;
       }
   }, [poseState, phase, trialPhase]);
@@ -180,34 +195,25 @@ function App() {
   // Cooldown Timer
   useEffect(() => {
       if (trialPhase === 'COOLDOWN') {
-          const t = setTimeout(() => {
+          if (cooldownTimer > 0) {
+              const t = setTimeout(() => setCooldownTimer(c => c - 1), 1000);
+              return () => clearTimeout(t);
+          } else {
               setTrialPhase('IDLE');
-          }, 3000);
-          return () => clearTimeout(t);
-      }
-  }, [trialPhase]);
-
-  // 4. PROTOCOL ENFORCEMENT (5 Trials -> Summary)
-  useEffect(() => {
-      if (phase === SessionPhase.GAME && history.length >= 5 && trialPhase === 'COOLDOWN') {
-           setTimeout(() => {
-               setPhase(SessionPhase.SUMMARY);
-               speak("Session complete. Great job.");
-           }, 2000);
-      }
-  }, [history.length, phase, trialPhase]);
-
-  // 5. HANDS-FREE GESTURES (Lobby Only)
-  useEffect(() => {
-      if (phase === SessionPhase.LOBBY && poseState.gestureProgress >= 100) {
-          if (poseState.detectedStartSide) {
-              setActiveSide(poseState.detectedStartSide);
-              performCalibration();
+              speak("Ready.");
           }
       }
-      setShowAutoStart(phase === SessionPhase.LOBBY && poseState.gestureProgress > 0);
-  }, [poseState.gestureProgress, poseState.detectedStartSide, phase, performCalibration]);
+  }, [trialPhase, cooldownTimer]);
 
+  // 5. PROTOCOL ENFORCEMENT (5 Trials -> Summary)
+  useEffect(() => {
+      if (phase === SessionPhase.GAME && history.length >= 5 && trialPhase === 'COOLDOWN' && cooldownTimer === 0) {
+           setTimeout(() => {
+               setPhase(SessionPhase.SUMMARY);
+               speak("Session complete. Analyzing data.");
+           }, 500);
+      }
+  }, [history.length, phase, trialPhase, cooldownTimer]);
 
   // RENDER
   return (
@@ -267,13 +273,12 @@ function App() {
                 onZoneChange={(zone, angle, vel, snap) => {
                     sendVisualAlert(snap, `Alert: ${zone} Zone, Angle: ${angle.toFixed(1)}, Speed: ${vel.toFixed(1)}`);
                     
-                    // Capture the FIRST failure snapshot of the trial for evidence
                     if (zone === SafetyZone.RED && !currentTrial.current.failSnapshot) {
                         currentTrial.current.failSnapshot = snap;
                         currentTrial.current.fail = true;
                     }
                 }}
-                onCalibrate={performCalibration}
+                onCalibrate={startCountdownProtocol}
                 poseState={poseState}
                 isLoading={isLoading}
                 onVideoMount={setVideoElement}
@@ -284,18 +289,55 @@ function App() {
                 activeSide={activeSide}
             />
 
-            {/* HANDS-FREE START UI */}
-            {showAutoStart && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in">
-                    <div className="flex flex-col items-center">
-                        <svg className="w-32 h-32 transform -rotate-90">
-                            <circle cx="64" cy="64" r="60" stroke="#334155" strokeWidth="8" fill="none" />
-                            <circle cx="64" cy="64" r="60" stroke="#2dd4bf" strokeWidth="8" fill="none" strokeDasharray="377" strokeDashoffset={377 - (377 * poseState.gestureProgress) / 100} />
-                        </svg>
-                        <p className="mt-4 text-xl font-bold text-white tracking-widest">
-                            {poseState.detectedStartSide ? `STARTING ${poseState.detectedStartSide}...` : "RAISE HAND TO START"}
-                        </p>
+            {/* COUNTDOWN OVERLAY */}
+            {countdown !== null && (
+                <div className="absolute inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in">
+                    <div className="relative">
+                        <div className="w-64 h-64 rounded-full border-8 border-slate-800 flex items-center justify-center bg-slate-900 shadow-2xl">
+                            <span className="text-9xl font-black text-white tabular-nums tracking-tighter animate-pulse">
+                                {countdown}
+                            </span>
+                        </div>
+                        <div className="absolute top-0 left-0 w-full h-full border-8 border-teal-500 rounded-full animate-ping opacity-20"></div>
                     </div>
+                    <div className="mt-12 text-center space-y-4">
+                        <h2 className="text-4xl font-bold text-white tracking-tight">GET INTO POSITION</h2>
+                        <div className="flex gap-8 text-xl font-medium text-teal-400">
+                            <span className="flex items-center gap-2"><Square className="w-5 h-5 fill-current"/> SIT BACK</span>
+                            <span className="flex items-center gap-2"><Square className="w-5 h-5 fill-current"/> FEET FLAT</span>
+                            <span className="flex items-center gap-2"><Square className="w-5 h-5 fill-current"/> ARMS 90°</span>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* REST & RESET OVERLAY (COOLDOWN) */}
+            {phase === SessionPhase.GAME && trialPhase === 'COOLDOWN' && (
+                <div className="absolute inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in">
+                    <div className="flex flex-col items-center gap-4">
+                        <div className="text-4xl font-black text-white tracking-widest">REST & RESET</div>
+                        <div className="w-64 h-2 bg-slate-700 rounded-full overflow-hidden">
+                            <div 
+                                className="h-full bg-teal-500 transition-all duration-1000 ease-linear"
+                                style={{ width: `${(cooldownTimer / 5) * 100}%` }}
+                            ></div>
+                        </div>
+                        <div className="text-teal-400 font-mono text-xl">{cooldownTimer}s</div>
+                    </div>
+                </div>
+            )}
+
+            {/* READY / LOCKED STATE UI */}
+            {phase === SessionPhase.GAME && trialPhase === 'IDLE' && poseState.isCalibrated && (
+                <div className="absolute inset-0 z-40 flex items-center justify-center bg-transparent pointer-events-none">
+                     <div className="flex flex-col items-center gap-2">
+                        <div className="relative">
+                             <div className="absolute inset-0 bg-teal-500/20 blur-xl rounded-full animate-pulse"></div>
+                             <div className="bg-slate-900/90 border-2 border-teal-500 text-teal-400 px-8 py-4 rounded-2xl font-black text-2xl tracking-widest shadow-2xl backdrop-blur-md">
+                                 REACH NOW!
+                             </div>
+                        </div>
+                     </div>
                 </div>
             )}
 
@@ -346,12 +388,53 @@ function App() {
 
                 {phase === SessionPhase.LOBBY && (
                     <div className="space-y-4">
+                        {/* ANTHROPOMETRY INPUTS */}
+                        <div className="bg-slate-800 p-4 rounded-xl space-y-4 border border-slate-700">
+                             {/* Height Input */}
+                             <div className="space-y-2">
+                                 <div className="flex items-center gap-2 text-slate-400 mb-1">
+                                    <Ruler className="w-4 h-4" />
+                                    <span className="text-xs font-bold uppercase tracking-wider">Patient Height</span>
+                                 </div>
+                                 <div className="flex items-center gap-2">
+                                     <input 
+                                        type="number" 
+                                        value={patientHeight}
+                                        onChange={(e) => setPatientHeight(Number(e.target.value))}
+                                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white font-mono font-bold text-lg focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                        min="100"
+                                        max="250"
+                                     />
+                                     <span className="text-slate-500 font-bold">cm</span>
+                                 </div>
+                             </div>
+
+                             {/* Arm Length Input */}
+                             <div className="space-y-2">
+                                 <div className="flex items-center gap-2 text-slate-400 mb-1">
+                                    <Scaling className="w-4 h-4" />
+                                    <span className="text-xs font-bold uppercase tracking-wider">Arm Length</span>
+                                 </div>
+                                 <div className="flex items-center gap-2">
+                                     <input 
+                                        type="number" 
+                                        value={patientArmLength}
+                                        onChange={(e) => setPatientArmLength(Number(e.target.value))}
+                                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white font-mono font-bold text-lg focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                        min="40"
+                                        max="100"
+                                     />
+                                     <span className="text-slate-500 font-bold">cm</span>
+                                 </div>
+                             </div>
+                        </div>
+
                         <div className="flex bg-slate-800 p-1 rounded-xl">
                             <button onClick={() => setActiveSide('LEFT')} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${activeSide === 'LEFT' ? 'bg-teal-600 text-white' : 'text-slate-400'}`}>LEFT ARM</button>
                             <button onClick={() => setActiveSide('RIGHT')} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${activeSide === 'RIGHT' ? 'bg-teal-600 text-white' : 'text-slate-400'}`}>RIGHT ARM</button>
                         </div>
                         <button 
-                            onClick={() => setPhase(SessionPhase.CALIBRATION)}
+                            onClick={startCountdownProtocol}
                             className="w-full py-4 bg-teal-600 hover:bg-teal-500 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-teal-900/50 transition-all"
                         >
                             <Crosshair className="w-5 h-5" />
@@ -369,8 +452,8 @@ function App() {
                             </div>
                         ) : (
                             <div className="flex gap-2">
-                                <button onClick={performCalibration} className="flex-1 py-4 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-bold flex items-center justify-center gap-2">
-                                    <Repeat className="w-4 h-4" /> RETRY
+                                <button className="flex-1 py-4 bg-slate-800 text-slate-400 rounded-xl font-bold flex items-center justify-center gap-2 cursor-wait">
+                                    <Activity className="w-4 h-4 animate-spin" /> CALIBRATING...
                                 </button>
                             </div>
                         )}

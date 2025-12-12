@@ -1,3 +1,4 @@
+
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from '@google/genai';
 
@@ -28,6 +29,22 @@ const tools: FunctionDeclaration[] = [
     }
 ];
 
+// WORKLET CODE: Runs in separate audio thread for stable 16kHz stream
+const WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+    process(inputs, outputs, parameters) {
+        const input = inputs[0];
+        if (input && input.length > 0) {
+            const channelData = input[0]; // Float32Array
+            // Send to main thread for encoding
+            this.port.postMessage(channelData);
+        }
+        return true;
+    }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
 interface UseGeminiLiveProps {
     onCalibrationCmd?: () => void;
     onStartGameCmd?: () => void;
@@ -41,8 +58,8 @@ export const useGeminiLive = ({ onCalibrationCmd, onStartGameCmd }: UseGeminiLiv
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
 
   // Initialize Audio Output (Speaker)
   const initAudioOutput = useCallback(() => {
@@ -61,42 +78,49 @@ export const useGeminiLive = ({ onCalibrationCmd, onStartGameCmd }: UseGeminiLiv
     }
   }, [initAudioOutput]);
 
-  // Audio Input Processing (Mic -> 16kHz PCM -> Gemini)
+  // Audio Input Processing (Mic -> Worklet -> PCM 16kHz -> Gemini)
   const startAudioInput = useCallback(async () => {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         mediaStreamRef.current = stream;
 
-        // Create a separate context for input processing to force 16kHz
+        // Force 16kHz context for simple resampling
         const inputContext = new AudioContext({ sampleRate: 16000 });
         inputContextRef.current = inputContext;
 
-        const source = inputContext.createMediaStreamSource(stream);
-        
-        // Use ScriptProcessor for raw PCM access 
-        const processor = inputContext.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
+        // Load Worklet
+        const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        await inputContext.audioWorklet.addModule(url);
 
-        processor.onaudioprocess = (e) => {
-            const inputData = e.inputBuffer.getChannelData(0);
+        const source = inputContext.createMediaStreamSource(stream);
+        const workletNode = new AudioWorkletNode(inputContext, 'pcm-processor');
+        workletNodeRef.current = workletNode;
+
+        // Worklet Message Handler (High frequency)
+        workletNode.port.onmessage = (e) => {
+            const inputData = e.data as Float32Array;
             
             // 1. Calculate Volume (RMS) for UI
+            // Simple subset sampling for UI perf
             let sum = 0;
-            for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
-            const rms = Math.sqrt(sum / inputData.length);
-            setVolume(Math.min(100, rms * 400)); // Scale for UI visibility
+            for(let i=0; i<inputData.length; i+=4) sum += inputData[i] * inputData[i];
+            const rms = Math.sqrt(sum / (inputData.length / 4));
+            setVolume(Math.min(100, rms * 400)); 
 
-            // 2. Convert to PCM 16-bit
+            // 2. Convert Float32 -> Int16 PCM
             const pcm16 = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
                 const s = Math.max(-1, Math.min(1, inputData[i]));
                 pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
 
-            // 3. Encode and Send
+            // 3. Base64 Encode and Send
+            // Using a more efficient binary to string approach for the socket
             let binary = '';
             const bytes = new Uint8Array(pcm16.buffer);
             const len = bytes.byteLength;
+            // Chunk processing for large buffers if needed, but 128 frames is small
             for (let i = 0; i < len; i++) {
                 binary += String.fromCharCode(bytes[i]);
             }
@@ -112,24 +136,19 @@ export const useGeminiLive = ({ onCalibrationCmd, onStartGameCmd }: UseGeminiLiv
             }
         };
 
-        source.connect(processor);
-        
-        // IMPORTANT: Connect to destination to keep the processor running, 
-        // but use a GainNode with 0 gain to prevent audio feedback loop.
-        const gainNode = inputContext.createGain();
-        gainNode.gain.value = 0;
-        processor.connect(gainNode);
-        gainNode.connect(inputContext.destination);
+        source.connect(workletNode);
+        // Worklet needs to connect to destination to be clocked, but we don't want to hear it
+        workletNode.connect(inputContext.destination);
 
     } catch (err) {
-        console.error("Mic Access Error:", err);
+        console.error("Mic Access/Worklet Error:", err);
     }
   }, []);
 
   const stopAudioInput = useCallback(() => {
-    if (processorRef.current) {
-        processorRef.current.disconnect();
-        processorRef.current = null;
+    if (workletNodeRef.current) {
+        workletNodeRef.current.disconnect();
+        workletNodeRef.current = null;
     }
     if (inputContextRef.current) {
         inputContextRef.current.close();

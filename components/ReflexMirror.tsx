@@ -37,46 +37,80 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [streamReady, setStreamReady] = useState(false);
 
-  // 1. CRITICAL: Camera Initialization Logic
+  // 1. CRITICAL: Camera Initialization Logic (Robust Retry)
   useEffect(() => {
     let stream: MediaStream | null = null;
+    let isMounted = true;
+
+    const getCameraStream = async (constraints: MediaStreamConstraints, timeoutMs = 5000) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const s = await navigator.mediaDevices.getUserMedia(constraints);
+            clearTimeout(timeoutId);
+            return s;
+        } catch (e) {
+            clearTimeout(timeoutId);
+            throw e;
+        }
+    };
 
     const startCamera = async () => {
         try {
             setCameraError(null);
             
-            // Clinical Requirement: High FPS for velocity tracking
-            const constraints: MediaStreamConstraints = {
-                audio: false,
-                video: {
-                    facingMode: 'user',
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
-                    frameRate: { ideal: 30 }
+            // ATTEMPT 1: High Performance (720p @ 30fps)
+            try {
+                stream = await getCameraStream({
+                    audio: false,
+                    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
+                }, 4000);
+            } catch (err) {
+                console.warn("HD Camera init failed, attempting fallback...", err);
+                
+                // ATTEMPT 2: Compatibility Mode (VGA, relaxed constraints)
+                try {
+                    stream = await getCameraStream({
+                        audio: false,
+                        video: { facingMode: 'user', width: { ideal: 640 } }
+                    }, 4000);
+                } catch (fallbackErr) {
+                    throw new Error("Could not acquire camera stream. Device may be busy or blocked.");
                 }
-            };
-
-            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            }
             
-            if (videoElementRef.current) {
+            if (!isMounted) {
+                stream?.getTracks().forEach(t => t.stop());
+                return;
+            }
+
+            if (videoElementRef.current && stream) {
                 videoElementRef.current.srcObject = stream;
-                // Wait for metadata to ensure dimensions are correct before processing
-                videoElementRef.current.onloadedmetadata = () => {
-                    if (videoElementRef.current) {
-                         videoElementRef.current.play();
-                         setStreamReady(true);
-                         onVideoMount(videoElementRef.current);
-                    }
-                };
+                videoElementRef.current.setAttribute('playsinline', 'true'); // iOS compatibility
+                
+                // Wait for video to actually be ready
+                await new Promise((resolve) => {
+                    if (!videoElementRef.current) return resolve(true);
+                    videoElementRef.current.onloadedmetadata = () => resolve(true);
+                });
+                
+                await videoElementRef.current.play();
+                
+                if (isMounted) {
+                    setStreamReady(true);
+                    onVideoMount(videoElementRef.current);
+                }
             }
         } catch (err: any) {
-            console.error("Camera Init Error:", err);
-            if (err.name === 'NotAllowedError') {
-                setCameraError("Camera permission denied. Please allow access in browser settings.");
-            } else if (err.name === 'NotReadableError') {
-                setCameraError("Camera is in use by another application.");
-            } else {
-                setCameraError("Could not access camera. Ensure no other apps are using it.");
+            console.error("Camera Final Error:", err);
+            if (isMounted) {
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    setCameraError("Camera permission denied. Please allow access in settings.");
+                } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+                    setCameraError("Camera is busy. Close other apps using camera.");
+                } else {
+                    setCameraError(err.message || "Failed to start camera.");
+                }
             }
         }
     };
@@ -84,11 +118,12 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
     startCamera();
 
     return () => {
+        isMounted = false;
         if (stream) {
             stream.getTracks().forEach(track => track.stop());
         }
     };
-  }, [onVideoMount]); // Only re-run if onVideoMount changes (mount)
+  }, [onVideoMount]); 
 
   // 2. Skeleton Rendering Loop
   const drawSkeleton = (ctx: CanvasRenderingContext2D, landmarks: any[], zone: SafetyZone) => {
@@ -108,9 +143,12 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
                 x: (leftHip.x + rightHip.x) / 2,
                 y: (leftHip.y + rightHip.y) / 2
             };
-            ctx.arc(hipCenter.x * ctx.canvas.width, hipCenter.y * ctx.canvas.height, 5, 0, 2 * Math.PI);
+            // Draw anchor point
+            ctx.arc(hipCenter.x * ctx.canvas.width, hipCenter.y * ctx.canvas.height, 6, 0, 2 * Math.PI);
             ctx.fillStyle = '#3B82F6'; // Blue
             ctx.fill();
+            ctx.strokeStyle = 'rgba(59, 130, 246, 0.5)';
+            ctx.stroke();
         }
     }
 
@@ -153,8 +191,11 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
         }
     });
 
-    // 3. Draw Reach Target (Active Fingertip)
+    // 3. Draw Reach Target (Active Fingertip/Virtual Knuckle)
     const tip = landmarks[ARM_LANDMARKS.INDEX];
+    const wrist = landmarks[ARM_LANDMARKS.WRIST];
+    
+    // Fallback drawing if tip is hidden but wrist is visible (Hemiplegic logic visualizer)
     if (tip && tip.visibility > 0.5) {
         ctx.beginPath();
         ctx.arc(tip.x * ctx.canvas.width, tip.y * ctx.canvas.height, 8, 0, 2 * Math.PI);
@@ -163,6 +204,15 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
         ctx.strokeStyle = 'white';
         ctx.lineWidth = 2;
         ctx.stroke();
+    } else if (wrist && wrist.visibility > 0.5) {
+        // Draw projected knuckle ghost
+        ctx.beginPath();
+        // Just a visual proxy, real math is in physics engine
+        ctx.arc(wrist.x * ctx.canvas.width, wrist.y * ctx.canvas.height, 6, 0, 2 * Math.PI);
+        ctx.fillStyle = strokeColor;
+        ctx.globalAlpha = 0.5;
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
     }
   };
 
@@ -172,6 +222,7 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
     if (!ctx) return;
 
     if (videoElementRef.current && videoElementRef.current.videoWidth > 0) {
+        // Sync canvas size to video stream resolution
         canvasRef.current.width = videoElementRef.current.videoWidth;
         canvasRef.current.height = videoElementRef.current.videoHeight;
     }
@@ -183,6 +234,7 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
   useEffect(() => {
     if (poseState.zone === SafetyZone.RED && prevZone !== SafetyZone.RED) {
       const now = Date.now();
+      // Debounce alerts (4s)
       if (now - lastAlertTime.current > 4000) { 
         lastAlertTime.current = now;
         if (canvasRef.current && videoElementRef.current) {
@@ -213,7 +265,7 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
         className="absolute inset-0 w-full h-full object-cover transform scale-x-[-1]" 
         playsInline 
         muted
-        // autoPlay is handled via ref callback/useEffect manually
+        autoPlay
       />
       
       <canvas 
@@ -248,8 +300,8 @@ export const ReflexMirror: React.FC<ReflexMirrorProps> = ({
           <div className="absolute inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
              <AlertOctagon className="w-16 h-16 text-red-500 mb-4" />
              <p className="font-bold text-xl text-white mb-2">Camera Access Failed</p>
-             <p className="text-slate-400 max-w-md">{cameraError}</p>
-             <button onClick={() => window.location.reload()} className="mt-6 px-6 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-white font-bold transition-colors">
+             <p className="text-slate-400 max-w-md mb-6">{cameraError}</p>
+             <button onClick={() => window.location.reload()} className="px-6 py-3 bg-slate-800 hover:bg-slate-700 rounded-lg text-white font-bold transition-colors border border-slate-600">
                  Retry Connection
              </button>
           </div>
